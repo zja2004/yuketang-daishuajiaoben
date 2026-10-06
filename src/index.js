@@ -65,9 +65,30 @@ async function videoItems(page) {
     index,
     title: row.querySelector('.leaf-item-title')?.textContent?.trim(),
     type: row.querySelector('.leaf-item-tag')?.textContent?.trim(),
+    // 已完成的视频：状态位里是对勾图标；进行中的是进度环（--p 为百分比）。
     done: !!row.querySelector('.leaf-item-status .icon-yuanquangou-mianzhuang'),
+    marked: row.querySelector('.leaf-item-status .icon-yuanquangou-mianzhuang, .leaf-item-status .status-pie') !== null,
     active: row.classList.contains('is-active'),
   })).filter((row) => row.title));
+}
+
+// 侧边栏是异步渲染的：行先出现、状态位后填充。
+// 若在状态位填充前读取，就会把“未开始”误读成“已完成”，导致直接放弃播放。
+async function sidebarItems(page, round = 1) {
+  await page.locator('.leaf-item').first().waitFor({ timeout: 30000 });
+  let items = [];
+  for (let attempt = 0; attempt < 20; attempt++) {
+    items = await videoItems(page);
+    if (items.length && items.every((item) => item.marked)) return items;
+    await sleep(1000);
+  }
+  if (round < 2) {
+    // 状态位迟迟不填充：刷新一次视频页后重试，避免用半成品数据下结论。
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.locator('video').waitFor({ timeout: 30000 }).catch(() => {});
+    return sidebarItems(page, round + 1);
+  }
+  return items;
 }
 
 async function openVideo(context, course) {
@@ -159,6 +180,26 @@ async function watch(page, item, speed, counts) {
   throw new Error(`播放结束，但页面没有确认完成：${item.title}。请检查网页提示。`);
 }
 
+async function startVideo(page, item) {
+  if (item.active) return;
+  const before = page.url();
+  await page.locator('.leaf-item').nth(item.index).click();
+  if (/\/video\/\d+/.test(before)) await page.waitForURL((url) => url.href !== before, { timeout: 30000 });
+  else await page.waitForURL(/\/video\//, { timeout: 30000 });
+  // 切换视频后侧边栏会重新渲染，等状态位填充完再进入播放判断。
+  await page.locator('video').waitFor({ timeout: 30000 });
+  await sidebarItems(page).catch(() => {});
+}
+
+async function runWatch(page, item, speed, counts) {
+  try {
+    await watch(page, item, speed, counts);
+  } catch (error) {
+    await renderOverlay(page, { title: item.title, status: `已停止：${error.message}`, ...counts }).catch(() => {});
+    throw error;
+  }
+}
+
 async function main() {
   const opts = options(process.argv.slice(2));
   if (opts.help) {
@@ -178,27 +219,43 @@ async function main() {
     if (!video) video = await openVideo(connection.context, course);
     let count = 0;
     while (count < opts.limit) {
-      const items = await videoItems(video);
-      const next = items.find((item) => item.type === '视频' && !item.done);
+      const items = await sidebarItems(video);
+      const videos = items.filter((item) => item.type === '视频');
+      const next = videos.find((item) => !item.done);
       if (!next) {
-        console.log('目录中的视频均显示已完成。');
+        // 侧边栏说“全完成”时，用课程目录复核一次，避免因渲染竞态而误判。
+        if (course) {
+          const expected = (await courseItems(course)).filter((row) => row.type === '视频').length;
+          if (videos.length !== expected) {
+            console.warn(`侧边栏读到 ${videos.length} 个视频，课程目录有 ${expected} 个，重新同步一次。`);
+            await video.reload({ waitUntil: 'domcontentloaded' });
+            await video.locator('video').waitFor({ timeout: 30000 }).catch(() => {});
+            const retry = (await sidebarItems(video)).filter((item) => item.type === '视频');
+            const pending = retry.find((item) => !item.done);
+            if (!pending) {
+              console.log(`目录中的视频均显示已完成（共 ${retry.length} 段）。`);
+              break;
+            }
+            await startVideo(video, pending);
+            const counts = {
+              done: retry.filter((item) => item.done).length,
+              total: retry.length,
+            };
+            await runWatch(video, pending, opts.speed, counts);
+            count++;
+            continue;
+          }
+        }
+        console.log(`目录中的视频均显示已完成（共 ${videos.length} 段）。`);
         break;
       }
-      if (!next.active) {
-        await video.locator('.leaf-item').nth(next.index).click();
-        await video.waitForURL(/\/video\//, { timeout: 30000 });
-      }
+      await startVideo(video, next);
       console.log(`[开始] ${next.title}`);
       const counts = {
-        done: items.filter((item) => item.type === '视频' && item.done).length,
-        total: items.filter((item) => item.type === '视频').length,
+        done: videos.filter((item) => item.done).length,
+        total: videos.length,
       };
-      try {
-        await watch(video, next, opts.speed, counts);
-      } catch (error) {
-        await renderOverlay(video, { title: next.title, status: `已停止：${error.message}`, ...counts }).catch(() => {});
-        throw error;
-      }
+      await runWatch(video, next, opts.speed, counts);
       console.log(`[完成] ${next.title}`);
       count++;
     }
